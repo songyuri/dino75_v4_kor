@@ -5,6 +5,7 @@
 이 정적 복제는 원본 페이지가 서버 POST/API에 의존할 때 완전 호환되지 않을 수 있다.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import mimetypes
 import re
@@ -134,6 +135,57 @@ def run(repository: str, output: str):
                 warnings.append(f'{ref}: {exc}')
         if count==0: break
 
+    # 웹사이트는 각 색상과 부품을 선택할 때만 새 이미지를 로드합니다.
+    # 첫 화면의 네트워크 요청 6개만 저장하면 다른 색상의 키보드가 보이지 않습니다.
+    app_source = snapshot.get('app.js', b'').decode('utf-8-sig', errors='replace')
+    if not app_source:
+        raise RuntimeError('원본 app.js를 가져오지 못했습니다. 키보드 미리보기를 만들 수 없습니다.')
+
+    def option_ids(label):
+        match = re.search(r'const\s+' + label + r'\s*=\s*\[(.*?)\];', app_source, re.S)
+        if not match:
+            raise RuntimeError(f'원본 app.js에서 {label}을 찾을 수 없습니다.')
+        return list(dict.fromkeys(re.findall(r'["\']id["\']\s*:\s*["\'](opt\d+)["\']', match.group(1))))
+
+    colors = option_ids('COLOR_OPTIONS')
+    weights = option_ids('WEIGHT_OPTIONS')
+    if not colors or not weights:
+        raise RuntimeError('원본 이미지 색상 옵션을 읽을 수 없습니다.')
+    # 현재 시뮬레이터의 구조: 4개 컬러 레이어 + 웨이트 + 고정 베이스.
+    missing_paths = [f'webp/front/{folder}/{code}.webp'
+                     for folder in ('top', 'bottom', 'screen', 'badge')
+                     for code in colors]
+    missing_paths += [f'webp/front/weight/{code}.webp' for code in weights]
+    missing_paths += ['webp/front/base/opt001.webp']
+    missing_paths = [key for key in dict.fromkeys(missing_paths) if key not in snapshot]
+
+    def fetch_image(key):
+        try:
+            res = requests.get(urljoin(ORIGIN, key), headers={
+                'User-Agent': 'Mozilla/5.0', 'Referer': ORIGIN,
+            }, timeout=25)
+            if res.ok and len(res.content) <= MAX_BYTES and (
+                    res.headers.get('content-type', '').startswith('image/') or
+                    res.content[:4] == b'RIFF'):
+                return key, res.content
+            return key, None
+        except requests.RequestException:
+            return key, None
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for future in as_completed([pool.submit(fetch_image, key) for key in missing_paths]):
+            key, data = future.result()
+            if data:
+                snapshot[key] = data
+            else:
+                warnings.append('이미지 수집 실패: ' + key)
+
+    # 누락 이미지가 발생해도 원인을 추적할 수 있도록 로그에 표시합니다.
+    images_stored = sum(k.startswith('webp/front/') and k.endswith('.webp') for k in snapshot)
+    print(f'키보드 이미지 수집: {images_stored}개 / 예상 {len(colors)*4 + len(weights)+1}개')
+    if images_stored < int((len(colors)*4 + len(weights)+1)*0.90):
+        raise RuntimeError(f'키보드 이미지가 너무 적습니다 ({images_stored}개). 누락: ' + ', '.join(warnings[-12:]))
+
     for path,body in snapshot.items():
         rel=Path(path)
         dest=target/rel
@@ -141,10 +193,10 @@ def run(repository: str, output: str):
         if path == 'index.html':
             dest.write_text(fix_html(html,base),encoding='utf-8')
         elif rel.suffix.lower() in ('.css','.js','.mjs'):
-            try:
-                dest.write_text(rewrite_root_paths(body.decode('utf-8'),base),encoding='utf-8')
-            except UnicodeDecodeError:
-                dest.write_bytes(body)
+            # JS의 문자열 접합 구분자 "/"는 절대경로가 아닙니다.
+            # 기존 rewrite_root_paths()가 이 구분자를 Pages 경로로 바꾸어
+            # webp/front/dino75_v4_kor/top/... 같은 잘못된 파일명을 만들었습니다.
+            dest.write_bytes(body)
         else:
             dest.write_bytes(body)
 
